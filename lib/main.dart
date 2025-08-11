@@ -68,7 +68,7 @@ class _MapScreenState extends State<MapScreen> {
 
   // Geofence params
   final LatLng _geofenceCenter = LatLng(30.723398, 76.847850);
-  final double _geofenceRadiusMeters = 20.0;
+  final double _geofenceRadiusMeters = 50.0;
   late final List<LatLng> _geofencePolygonCoords;
 
   bool? _insideGeofence; // null on start
@@ -141,38 +141,43 @@ class _MapScreenState extends State<MapScreen> {
 
   Future<void> _initLocation() async {
     try {
-      // Check if location services are enabled
+      // Ask for location permission first
+      var status = await Permission.locationWhenInUse.status;
+      if (status.isDenied || status.isRestricted) {
+        status = await Permission.locationWhenInUse.request();
+      }
+
+      if (status.isPermanentlyDenied) {
+        // User previously chose "Don't ask again"
+        await openAppSettings();
+        return;
+      }
+
+      if (!status.isGranted) {
+        // Permission still not granted
+        return;
+      }
+
+      // Make sure location services are enabled
       bool serviceEnabled = await _serviceEnabledWithRetry();
       if (!serviceEnabled) {
         serviceEnabled = await _location.requestService();
-        if (!serviceEnabled) {
-          throw Exception('Location service disabled by user');
-        }
+        if (!serviceEnabled) return;
       }
 
-      // Check and request location permission (using prefix solution)
-      var permissionStatus = await Permission.locationWhenInUse.status;
-      if (!permissionStatus.isGranted) {
-        permissionStatus = await Permission.locationWhenInUse.request();
-        if (!permissionStatus.isGranted) {
-          throw Exception('Location permission denied by user');
-        }
-      }
-
-      // For background location (optional)
+      // Optional: request background location (Android)
       if (Platform.isAndroid) {
-        final backgroundStatus = await Permission.locationAlways.status;
-        if (!backgroundStatus.isGranted) {
-          await Permission.locationAlways.request();
-        }
+        await Permission.locationAlways.request();
       }
 
+      // Configure location updates
       await _location.changeSettings(
         accuracy: LocationAccuracy.high,
-        interval: 1000,
-        distanceFilter: 1,
+        interval: 3000,
+        distanceFilter: 3,
       );
 
+      // Listen to location changes
       _location.onLocationChanged.listen((loc) {
         if (!mounted) return;
         setState(() => _currentLocation = loc);
@@ -182,15 +187,10 @@ class _MapScreenState extends State<MapScreen> {
         }
       });
 
+      // Get current location
       _currentLocation = await _location.getLocation();
-
       if (_currentLocation?.latitude != null && _currentLocation?.longitude != null) {
         _checkGeofence(LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!));
-      }
-    } catch (e) {
-      setState(() => _error = e.toString());
-      if (e.toString().contains('permission')) {
-        _showPermissionDialog();
       }
     } finally {
       setState(() => _showLoading = false);
@@ -238,29 +238,30 @@ class _MapScreenState extends State<MapScreen> {
             onMapCreated: _onMapCreated,
           ),
           if (_showLoading) const Center(child: CircularProgressIndicator()),
-          if (_error.isNotEmpty)
-            Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text(
-                  _error,
-                  style: const TextStyle(color: Colors.red, fontSize: 18),
-                  textAlign: TextAlign.center,
-                ),
-                if (_error.contains('permission'))
-                  Padding(
-                    padding: const EdgeInsets.only(top: 20),
-                    child: ElevatedButton(
-                      onPressed: _initLocation,
-                      child: const Text('Retry'),
-                    ),
-                  ),
-              ],
+
+          // Live Altitude display
+          Positioned(
+            top: 20,
+            left: 10,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.black87,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                _currentLocation?.altitude != null
+                    ? 'Altitude: ${_currentLocation!.altitude!.toStringAsFixed(2)} m'
+                    : 'Altitude: --',
+                style: const TextStyle(color: Colors.white, fontSize: 16),
+              ),
             ),
+          ),
         ],
       ),
     );
   }
+
 
   Future<void> _onMapCreated(MapboxMap mapboxMap) async {
     _mapboxMap = mapboxMap;
@@ -319,7 +320,18 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   void _checkGeofence(LatLng userLocation) {
-    final inside = _pointInPolygon(userLocation, _geofencePolygonCoords);
+    final insidePolygon = _pointInPolygon(userLocation, _geofencePolygonCoords);
+
+    // Check altitude if available (elevation above sea level)
+    bool belowCeiling = true;
+    if (_currentLocation?.altitude != null) {
+      const groundFloorElevation = 320.0; // meters above sea level
+      const ceilingHeight = 5.0; // meters (building height)
+      const maxAltitude = groundFloorElevation + ceilingHeight; // 380m
+      belowCeiling = (_currentLocation!.altitude! <= maxAltitude);
+    }
+
+    final inside = insidePolygon && belowCeiling;
 
     if (_insideGeofence == null) {
       _insideGeofence = inside;
@@ -328,8 +340,14 @@ class _MapScreenState extends State<MapScreen> {
 
     if (inside != _insideGeofence) {
       _insideGeofence = inside;
-      final message = inside ? "Entered geofence area" : "Exited geofence area";
-
+      String message;
+      if (inside) {
+        message = "Entered geofence area";
+      } else if (!belowCeiling) {
+        message = "Exited geofence area: above ceiling";
+      } else {
+        message = "Exited geofence area";
+      }
       _showNotification(message);
     }
   }
